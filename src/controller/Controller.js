@@ -32,6 +32,8 @@ dojo.require("mojo.command.Behavior");
 dojo.require("mojo.command.Rule");
 dojo.require("mojo.controller.Request");
 
+__mojoStates = null;
+
 dojo.declare("mojo.controller.Controller", null, 
 {
 	constructor: function(contextElementObj, params) {
@@ -93,6 +95,10 @@ dojo.declare("mojo.controller.Controller", null,
 		this._callBaseMethod("addCommands")
 		this.addCommands();
 		this._addObservers();
+		this._callBaseMethod("addStates");
+		this._addStates();
+		this._callBaseMethod("addTransitions");
+		this._addTransitions();
 		this._callBaseMethod("addIntercepts")
 		this.addIntercepts();
 		this.onInit();
@@ -271,7 +277,7 @@ dojo.declare("mojo.controller.Controller", null,
 			
 			(end)
 	*/
-	addObserver: function(srcObj, srcFunc, cmdName, paramsObj) {
+	addObserver: function(srcObj, srcFunc, cmdName, paramsObj, srcState, destState, duration) {
 		var isArrayOfStrings = function(srcObj) {
 			if(!dojo.isArray(srcObj)) return false;
 
@@ -309,7 +315,7 @@ dojo.declare("mojo.controller.Controller", null,
 				// event delegation only works for events that bubble: onclick, onmouse*, onkey*, onmove*, etc.
 				if (this.getContextElement() && srcFunc.match(/^onclick|onmouse|onkey|onmove/) != null) {
 					// store css query for comparison later in event delegation
-					this._addObserver(this.getContextElement(), srcFunc, [{cmdName: cmdName, paramsObj: paramsObj, eventDelegate: tmpQuery}]);
+					this._addObserver(this.getContextElement(), srcFunc, [{cmdName: cmdName, paramsObj: paramsObj, eventDelegate: tmpQuery, srcState : srcState, destState : destState, duration : duration}]);
 				} else {
 					if (!this._queryCache[tmpQuery]) {
 						// if string, treat as dom query
@@ -322,7 +328,7 @@ dojo.declare("mojo.controller.Controller", null,
 						this._observers[tmpQuery][srcFunc] = new Array();
 					}
 					var obsLength = this._observers[tmpQuery][srcFunc].length;
-					this._observers[tmpQuery][srcFunc][obsLength] = {cmdName: cmdName, paramsObj: paramsObj};
+					this._observers[tmpQuery][srcFunc][obsLength] = {cmdName: cmdName, paramsObj: paramsObj, srcState : srcState, destState : destState, duration : duration};
 				}
 			}
 		} else {
@@ -330,7 +336,7 @@ dojo.declare("mojo.controller.Controller", null,
 				srcObj = [srcObj];
 			}
 			for (var i = 0, len = srcObj.length; i < len; i++) {
-				this._addObserver(srcObj[i], srcFunc, [{cmdName: cmdName, paramsObj: paramsObj}]);
+				this._addObserver(srcObj[i], srcFunc, [{cmdName: cmdName, paramsObj: paramsObj, srcState : srcState, destState : destState, duration : duration}]);
 			}
 			
 		}
@@ -378,16 +384,30 @@ dojo.declare("mojo.controller.Controller", null,
 				} else {
 					var observerBatchLength = observerBatch.length;
 					for (var i = 0; i < observerBatchLength; i++) {
-						if(typeof(mojo) != "undefined") {
-							var callerObj = srcObj;
-							if (observerBatch[i].eventDelegate.length > 0) {
-								// compare stored css query against event target. Fire commands only if target matches
-								var target = getEventTarget(e);
-								callerObj = mojo.queryMatch(target, observerBatch[i].eventDelegate, __this.getContextElement(), true);
-							}
-							if (callerObj != null) {
-								var requestObj = __this._setRequest(observerBatch[i].paramsObj, callerObj, e, observerBatch[i].cmdName);
-								__this.fireCommandChain(observerBatch[i].cmdName, requestObj);
+						//if there's a src state and we're not in it, block the execution
+						if (!observerBatch[i].srcState || mojo.Model.get('mojo/states/Current/State') == observerBatch[i].srcState) {
+							if(typeof(mojo) != "undefined") {
+								var callerObj = srcObj;
+								if (observerBatch[i].eventDelegate.length > 0) {
+									// compare stored css query against event target. Fire commands only if target matches
+									var target = getEventTarget(e);
+									callerObj = mojo.queryMatch(target, observerBatch[i].eventDelegate, __this.getContextElement(), true);
+								}
+								if (callerObj != null) {
+									var requestObj = __this._setRequest(observerBatch[i].paramsObj, callerObj, e, observerBatch[i].cmdName);
+									__this.fireCommandChain(observerBatch[i].cmdName, requestObj);
+									
+									//proceed to next state if there's a destination state specified
+									if (observerBatch[i].destState) {
+										var intDestState = observerBatch[i].destState;
+										var intID = window.setInterval(function() { 
+											mojo.Model.set('mojo/states/Current/State', intDestState);
+											mojo.Messaging.publish('mojo/states/' + __this.declaredClass +  '/Current/State/' + intDestState);
+											console.log(intDestState);
+											window.clearInterval(intID);
+										}, observerBatch[i].duration);
+									}
+								}
 							}
 						}
 					}
@@ -417,6 +437,9 @@ dojo.declare("mojo.controller.Controller", null,
 	},
 	_generateTagKey: function(srcFunc, cmd) {
 		var tagKey = srcFunc + "_" + cmd.cmdName;
+		if (typeof(cmd.srcState) != "undefined") tagKey += "_" + cmd.srcState;
+		if (typeof(cmd.destState) != "undefined") tagKey += "_" + cmd.destState;
+		if (typeof(cmd.duration) != "undefined") tagKey += "_" + cmd.duration;
 		if (cmd.paramsObj) {
 			var serializeRequest;
 			if (typeof(cmd.paramsObj) == "function") {
@@ -722,6 +745,156 @@ dojo.declare("mojo.controller.Controller", null,
 	_setRequest: function(paramsObj, callerObj, eventObj, cmdName, invocation) {
     		var requestObj = new mojo.controller.Request(paramsObj, callerObj, eventObj, cmdName, this, invocation);
 		return requestObj;
+	},
+	
+	/*
+	 * Added by: Brad Swerdfeger
+	 * Date: April, 2010
+	 * TODO: Add assertions to states.
+	 * State-driven controller functionality.
+	 */
+	
+	
+	/*
+		Function: _addStates
+		
+		This is simply an abstract function similar to addObservers, addCommands, and addIntercepts. 
+		It is not required, but it is easy to make it so. 
+		*The first state added is the initial state of the controller.*
+		
+		Example:
+			(start code)
+			// inside a controller implementation
+			//...
+			addStates: function() {
+				this.addState('State1');
+				this.addState('State2', 'DoStuff', function(context, caller) {
+				  console.log('calling DoStuff');
+				  return {
+				    stuff1 : 'stuff',
+				    stuff2 : 'more stuff'
+				  };
+				});
+			//..
+			(end)
+	
+	 */
+	_addStates: function() {
+		this.addStates();
+	},
+
+	/*
+		Function: addState
+		
+		Add a state to the controller. You can also optionally fire a command when the state is reached.
+		
+		Parameters:
+			stateName: The name of the state.  Transitions refer to this name. Example: 'State1'.
+ 			cmdName (optional): The command to fire (similar to commands in addObserver). Must have been added via 'addCommand'. Example: 'ShowErrors'.
+ 			paramsObj (optional) : The parameters object for the command. Example: function(context, caller) { return { stuff: 'stuff' } }
+		
+		Example without a command:
+		
+			this.addState('State1');
+		
+		Example with a command: 
+				
+		this.addState('State2', 'DoStuff', function(context, caller) {
+		  console.log('calling DoStuff');
+		  return {
+		    stuff1 : 'stuff',
+		    stuff2 : 'more stuff'
+		  };
+		});
+	 */
+	addState : function(stateName, cmdName, paramsObj) {
+		if (!__mojoStates) {
+			__mojoStates = new Object();
+			__mojoStates[stateName] = true;
+			mojo.Model.set('mojo/states/Current/State', stateName);
+		} else {
+			__mojoStates[stateName] = true;	
+		}
+		if (cmdName) {
+			this.addObserver(mojo.Messaging.getTopic('mojo/states/' + this.declaredClass +  '/Current/State/' + stateName), 'onPublish', cmdName, paramsObj);
+		}
+	},
+	
+	/*
+		Function: getCurrentState
+		
+		Retrieve the current state of the controller.
+		
+		Example:
+		
+			//in controller implementation in function addStates:
+			var __this = this;
+			this.addState('State2', 'DoStuff', function(context, caller) {
+			  console.log('currently in state: ' + __this.getCurrentState());
+			});
+			
+			** Prints 'currently in state: State2' in console.
+		
+	 */
+	getCurrentState : function() {
+		return mojo.Model.get('mojo/states/Current/State');
+	},
+	
+	/*
+		Function: _addTransitions
+		
+		This is simply an abstract function similar to addObservers, addCommands, and addIntercepts. 
+		It is not required, but it is easy to make it so.
+		
+		Example:
+			(start code)
+			// inside a controller implementation
+			//...
+			addTransitions: function() {
+				this.addTransition('.clickme-to-animate', 'onclick', 'AnimateThing', 'State1', 'State2', 1500, { style : 'easeInOutExpo' });
+			});
+			//..
+			(end)
+
+	 */
+	_addTransitions: function() {
+		__mojoTransitions = new Object();
+		this.addTransitions();
+	},
+	
+	/*
+		Function: addTransition
+		
+		Add a transition from one state to another in the controller, given an observation of an event (similar to addObserver). 
+		The source and destination states must have been declared and you have to specify a duration (0 is ASAP). 
+		The duration is useful for state transitions that involved animation
+		
+		Parameters:
+			srcObj: The object to observe for initiating the transition. Can be a css selector, mojo topic, mojo notify, etc. (identical to addObserver). Example: 'container div.clickme' or mojo.Messaging.getTopic('Something/Happened')
+			srcFunc: The event to observe on srcObj. Example: 'onclick' or 'onPublish'
+			cmdName: The command to fire (similar to commands in addObserver). Must have been added via 'addCommand'. Example: 'AnimateSomething'.
+			srcState : The source state of the transition. For the command to fire, the controller must be in this state. Example: 'State1'
+			destState : The state to transition to. Example: 'State2'
+			duration : The duration of the transition in milliseconds. The state change will not fire until this delay is complete.  0 is ASAP. Example: 1800
+			paramsObj (optional) : The parameters object for the command. Example: { stuff: 'stuff' }
+		
+		Example: Transition from State1 to State2 with an animation that lasts 1500ms
+		
+			this.addTransition('.clickme-to-animate', 'onclick', 'AnimateThing', 'State1', 'State2', 1500, { style : 'easeInOutExpo' });
+	 */
+	addTransition : function(srcObj, srcFunc, cmdName, srcState, destState, duration, paramsObj) {
+		if (typeof(__mojoTransitions) == "undefined") {
+			throw new Error('ERROR mojo.controller.Controller.addTransition - addTransitions must be called first.');
+		}
+		if (!__mojoStates[srcState]) {
+			throw new Error('ERROR mojo.controller.Controller.addTransition - srcState' + srcState + ' not defined.');
+		}
+		if (!__mojoStates[destState]) {
+			throw new Error('ERROR mojo.controller.Controller.addTransition - destState' + destState + ' not defined.');
+		}
+
+		//Now create the observer
+		this.addObserver(srcObj, srcFunc, cmdName, paramsObj, srcState, destState, duration);
 	}
 });
 /*
